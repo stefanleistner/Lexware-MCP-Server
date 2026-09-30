@@ -8,6 +8,7 @@ import {
 } from "skybridge/server";
 import { createHash } from "node:crypto";
 import * as jose from "jose";
+import { describeVerifyError, logEvent, peekToken } from "./request-log.js";
 
 /**
  * Authorization-server metadata, taken from the router that serves it rather than imported
@@ -144,18 +145,38 @@ async function fetchVerifiedUserinfoEmail(
   token: string,
   userinfoUrl: string,
   fetchFn: typeof fetch,
+  log: typeof logEvent = logEvent,
 ): Promise<string | undefined> {
   try {
     const res = await fetchFn(userinfoUrl, {
       headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(USERINFO_TIMEOUT_MS),
     });
-    if (!res.ok) return undefined;
+    if (!res.ok) {
+      log("auth.userinfo_failed", {
+        reason: `userinfo returned HTTP ${res.status} (token lacks openid/email scope?)`,
+        userinfoUrl,
+        status: res.status,
+      });
+      return undefined;
+    }
     const data = (await res.json()) as Record<string, unknown>;
     const email = typeof data.email === "string" ? data.email : undefined;
-    if (!email) return undefined;
-    return isEmailVerified(data.email_verified) ? email : undefined;
-  } catch {
+    if (!email) {
+      log("auth.userinfo_failed", { reason: "userinfo response has no email (email scope missing?)", userinfoUrl });
+      return undefined;
+    }
+    if (!isEmailVerified(data.email_verified)) {
+      log("auth.userinfo_failed", { reason: "email not verified at the IdP (email_verified is not true)", userinfoUrl });
+      return undefined;
+    }
+    return email;
+  } catch (err) {
+    log("auth.userinfo_failed", {
+      reason: "userinfo not reachable",
+      userinfoUrl,
+      detail: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+    });
     return undefined;
   }
 }
@@ -164,6 +185,8 @@ export interface VerifierDeps {
   /** JWKS resolver; injectable for tests. Defaults to a remote JWKS set. */
   jwks?: ReturnType<typeof jose.createRemoteJWKSet>;
   fetchFn?: typeof fetch;
+  /** Diagnostic logger; injectable for tests. Never receives token material. */
+  log?: typeof logEvent;
 }
 
 /**
@@ -177,6 +200,7 @@ export interface VerifierDeps {
 export function createAccessTokenVerifier(oauth: OAuthSettings, deps: VerifierDeps = {}) {
   const jwks = deps.jwks ?? jose.createRemoteJWKSet(new URL(oauth.jwksUrl));
   const fetchFn = deps.fetchFn ?? fetch;
+  const log = deps.log ?? logEvent;
   // Caches only successful userinfo lookups (token -> email) to avoid re-hitting
   // userinfo on every request. Misses are never cached (see below).
   const emailCache = new Map<string, { email: string; exp: number }>();
@@ -199,12 +223,24 @@ export function createAccessTokenVerifier(oauth: OAuthSettings, deps: VerifierDe
         issuer: oauth.issuer,
         ...(oauth.verifyAudience ? { audience: audiences } : {}),
       }));
-    } catch {
+    } catch (err) {
+      // Why the token was refused, plus the unverified iss/aud/exp to compare against
+      // config. Never the token itself (see request-log.ts).
+      log("auth.token_rejected", {
+        ...describeVerifyError(err),
+        ...peekToken(token),
+        expectedIssuer: oauth.issuer,
+        expectedAudience: oauth.verifyAudience ? audiences : "(audience check disabled)",
+        jwksUrl: oauth.jwksUrl,
+      });
       throw new OAuthError(OAuthErrorCode.InvalidToken, "Invalid or expired access token");
     }
 
     const sub = typeof payload.sub === "string" ? payload.sub : "";
-    if (!sub) throw new OAuthError(OAuthErrorCode.InvalidToken, "Token is missing the sub claim");
+    if (!sub) {
+      log("auth.token_rejected", { reason: "token is missing the sub claim", ...peekToken(token) });
+      throw new OAuthError(OAuthErrorCode.InvalidToken, "Token is missing the sub claim");
+    }
 
     // Trust the email for authorization only when the IdP marked it verified; an
     // unverified token email falls through to the (also verification-checked) userinfo lookup.
@@ -222,7 +258,7 @@ export function createAccessTokenVerifier(oauth: OAuthSettings, deps: VerifierDe
         if (cached && cached.exp > nowSec) {
           email = cached.email;
         } else {
-          email = await fetchVerifiedUserinfoEmail(token, oauth.userinfoUrl, fetchFn);
+          email = await fetchVerifiedUserinfoEmail(token, oauth.userinfoUrl, fetchFn, log);
           // Cache only positive (verified) results: caching a transient miss would
           // lock out a valid user until their token expires.
           if (email) {
@@ -264,7 +300,10 @@ const DOMAIN_REFUSED = "Your email domain is not permitted to use this server";
  * Fails closed: no `req.auth` (mounted without the verifier ahead of it) or no verified
  * email both count as refused.
  */
-export function requireAllowedEmailDomain(allowed: string[]): RequestHandler {
+export function requireAllowedEmailDomain(
+  allowed: string[],
+  log: typeof logEvent = logEvent,
+): RequestHandler {
   return (req, res, next) => {
     if (allowed.length === 0) {
       next();
@@ -275,6 +314,16 @@ export function requireAllowedEmailDomain(allowed: string[]): RequestHandler {
       next();
       return;
     }
+    // Log the domain only, never the full address.
+    const addr = typeof email === "string" ? email : undefined;
+    const at = addr ? addr.lastIndexOf("@") : -1;
+    log("auth.email_domain_refused", {
+      reason: addr
+        ? "email domain not in OAUTH_ALLOWED_EMAIL_DOMAINS"
+        : "no verified email for this user (token has no verified email claim and userinfo gave none)",
+      ...(addr && at >= 0 ? { domain: addr.slice(at + 1).toLowerCase() } : {}),
+      allowed,
+    });
     res.status(403).json({ error: "access_denied", error_description: DOMAIN_REFUSED });
   };
 }
@@ -294,6 +343,6 @@ export function oauthGate(
       verifier: { verifyAccessToken: createAccessTokenVerifier(oauth, deps) },
       resourceMetadataUrl,
     }),
-    requireAllowedEmailDomain(oauth.allowedEmailDomains),
+    requireAllowedEmailDomain(oauth.allowedEmailDomains, deps.log),
   ];
 }

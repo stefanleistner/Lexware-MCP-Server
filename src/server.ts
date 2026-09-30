@@ -7,6 +7,7 @@ import { LexwareClient } from "./lexware/client.js";
 import { advertisedScopes, buildOAuthMetadata, oauthGate, protectedResourceMetadataUrl } from "./oauth.js";
 import { createFinalizeConfirmation } from "./tools/finalize-confirmation.js";
 import { registerTools } from "./tools/index.js";
+import { requestLogger } from "./request-log.js";
 import { INERT_APP_JSON } from "./server-body-parsing.js";
 import { registerUploadRoutes } from "./uploads/routes.js";
 import { TicketStore } from "./uploads/tickets.js";
@@ -131,6 +132,11 @@ const app = new Skybridge({
 // Everything below is registered BEFORE app.run(). Skybridge appends its own /assets,
 // /mcp and error middleware inside run(), so anything added afterwards would land behind
 // the default error handler.
+
+// One log line per request (method, path, status, user agent, whether an Authorization
+// header was sent — never its value). Mounted first so it also sees what the auth gate
+// rejects. See request-log.ts for what is and is not logged.
+app.express.use(requestLogger());
 
 // Unauthenticated health check. Use `/status`, not `/healthz`: Google Front End
 // intercepts `/healthz` on Cloud Run (it never reaches the container).
